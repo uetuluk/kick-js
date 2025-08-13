@@ -1,22 +1,44 @@
 import WebSocket from "ws";
 import EventEmitter from "events";
-import { authentication, getChannelData, getVideoData } from "../core/kickApi";
 import { createWebSocket } from "../core/websocket";
 import { parseMessage } from "../core/messageHandling";
-import type { KickChannelInfo } from "../types/channels";
-import type { VideoInfo } from "../types/video";
-import type {
-  KickClient,
-  ClientOptions,
-  AuthenticationSettings,
-  Poll,
-  Leaderboard,
-  LoginOptions,
+import {
+  ConnectionState,
+  ErrorType,
+  type KickClient,
+  type ClientOptions,
+  type Logger,
+  type ConnectionOptions,
+  type KickError,
 } from "../types/client";
 import type { MessageData } from "../types/events";
-import { validateCredentials } from "../utils/utils";
 
-import { createHeaders, makeRequest } from "../core/requestHelper";
+// Default no-op logger for production
+const createDefaultLogger = (): Logger => ({
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+});
+
+// Console logger for debugging
+const createConsoleLogger = (): Logger => ({
+  debug: (message: string, ...args: any[]) => console.debug(`[KickJS DEBUG] ${message}`, ...args),
+  info: (message: string, ...args: any[]) => console.info(`[KickJS INFO] ${message}`, ...args),
+  warn: (message: string, ...args: any[]) => console.warn(`[KickJS WARN] ${message}`, ...args),
+  error: (message: string, error?: any) => console.error(`[KickJS ERROR] ${message}`, error),
+});
+
+// Resolve logger from options
+const resolveLogger = (loggerOption?: Logger | boolean): Logger => {
+  if (loggerOption === true) {
+    return createConsoleLogger();
+  } else if (loggerOption === false || loggerOption === undefined) {
+    return createDefaultLogger();
+  } else {
+    return loggerOption;
+  }
+};
 
 export const createClient = (
   channelName: string,
@@ -24,550 +46,372 @@ export const createClient = (
 ): KickClient => {
   const emitter = new EventEmitter();
   let socket: WebSocket | null = null;
-  let channelInfo: KickChannelInfo | null = null;
-  let videoInfo: VideoInfo | null = null;
+  let channelInfo: { id: number; name: string } | null = null;
+  
+  // Connection and reconnection state
+  let connectionState: ConnectionState = ConnectionState.DISCONNECTED;
+  let reconnectAttempts = 0;
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  let heartbeatTimer: NodeJS.Timeout | null = null;
+  let isDisconnected = false;
 
-  let clientToken: string | null = null;
-  let clientCookies: string | null = null;
-  let clientBearerToken: string | null = null;
-  let isLoggedIn = false;
+  // Listener tracking for proper cleanup
+  const listeners = new Map<string, Set<Function>>();
+  const onceListeners = new Map<string, Set<Function>>();
 
-  const defaultOptions: ClientOptions = {
-    plainEmote: true,
-    logger: false,
-    readOnly: false,
+  // Default options
+  const defaultConnectionOptions: ConnectionOptions = {
+    autoReconnect: true,
+    maxReconnectAttempts: 10,
+    reconnectInterval: 1000,
+    maxReconnectInterval: 30000,
+    heartbeatInterval: 30000,
   };
 
-  const mergedOptions = { ...defaultOptions, ...options };
+  const logger = resolveLogger(options.logger);
 
-  const checkAuth = () => {
-    if (!isLoggedIn) {
-      throw new Error("Authentication required. Please login first.");
-    }
-    if (!clientBearerToken) {
-      throw new Error("Missing bearer token");
-    }
-
-    if (!clientCookies) {
-      throw new Error("Missing cookies");
-    }
+  const mergedOptions = { 
+    ...options,
+    logger,
+    connection: { ...defaultConnectionOptions, ...options.connection }
   };
 
-  const login = async (options: LoginOptions) => {
-    const { type, credentials } = options;
+  const createError = (type: ErrorType, message: string, originalError?: Error, code?: string | number): KickError => ({
+    type,
+    message,
+    originalError,
+    code,
+    context: { channelName, connectionState }
+  });
 
-    try {
-      switch (type) {
-        case "login":
-          if (!credentials) {
-            throw new Error("Credentials are required for login");
-          }
-          validateCredentials(options);
-
-          if (mergedOptions.logger) {
-            console.log("Starting authentication process with login ...");
-          }
-
-          const { bearerToken, xsrfToken, cookies, isAuthenticated } =
-            await authentication({
-              username: credentials.username,
-              password: credentials.password,
-              otp_secret: credentials.otp_secret,
-            });
-
-          if (mergedOptions.logger) {
-            console.log("Authentication tokens received, validating...");
-          }
-
-          clientBearerToken = bearerToken;
-          clientToken = xsrfToken;
-          clientCookies = cookies;
-          isLoggedIn = isAuthenticated;
-
-          if (!isAuthenticated) {
-            throw new Error("Authentication failed");
-          }
-
-          if (mergedOptions.logger) {
-            console.log("Authentication successful, initializing client...");
-          }
-
-          await initialize();
-          break;
-
-        case "tokens":
-          if (!credentials) {
-            throw new Error("Tokens are required for login");
-          }
-
-          if (mergedOptions.logger) {
-            console.log("Starting authentication process with tokens ...");
-          }
-
-          clientBearerToken = credentials.bearerToken;
-          clientToken = credentials.xsrfToken;
-          clientCookies = credentials.cookies;
-
-          isLoggedIn = true;
-
-          await initialize();
-          break;
-        default:
-          throw new Error("Invalid authentication type");
-      }
-
-      return true;
-    } catch (error) {
-      console.error("Login failed:", error);
-      throw error;
+  const handleError = (error: KickError) => {
+    logger.error(`KickClient Error ${error.type}: ${error.message}`, error.originalError);
+    if (mergedOptions.onError) {
+      mergedOptions.onError(error);
     }
   };
 
-  const initialize = async () => {
-    try {
-      if (mergedOptions.readOnly === false && !isLoggedIn) {
-        throw new Error("Authentication required. Please login first.");
+  const setConnectionState = (newState: ConnectionState) => {
+    if (connectionState !== newState) {
+      connectionState = newState;
+      logger.info(`Connection state changed to: ${newState}`);
+      if (mergedOptions.onConnectionStateChange) {
+        mergedOptions.onConnectionStateChange(newState);
       }
+    }
+  };
 
-      if (mergedOptions.logger) {
-        console.log(`Fetching channel data for: ${channelName}`);
+  const addListener = (event: string, listener: Function, once = false) => {
+    const targetMap = once ? onceListeners : listeners;
+    if (!targetMap.has(event)) {
+      targetMap.set(event, new Set());
+    }
+    targetMap.get(event)!.add(listener);
+    
+    if (once) {
+      const wrappedListener = (...args: any[]) => {
+        removeListener(event, listener);
+        (listener as any)(...args);
+      };
+      emitter.once(event, wrappedListener);
+    } else {
+      emitter.on(event, listener as any);
+    }
+  };
+
+  const removeListener = (event: string, listener: Function) => {
+    // Remove from tracking
+    listeners.get(event)?.delete(listener);
+    onceListeners.get(event)?.delete(listener);
+    
+    // Remove from EventEmitter
+    emitter.removeListener(event, listener as any);
+  };
+
+  const removeAllListeners = (event?: string) => {
+    if (event) {
+      listeners.get(event)?.clear();
+      onceListeners.get(event)?.clear();
+      emitter.removeAllListeners(event);
+    } else {
+      listeners.clear();
+      onceListeners.clear();
+      emitter.removeAllListeners();
+    }
+  };
+
+  const startHeartbeat = () => {
+    if (!mergedOptions.connection?.heartbeatInterval || heartbeatTimer) {
+      return;
+    }
+
+    heartbeatTimer = setInterval(() => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        logger.debug("Sending heartbeat ping");
+        socket.ping();
       }
+    }, mergedOptions.connection.heartbeatInterval);
+  };
 
-      channelInfo = await getChannelData(channelName);
-      if (!channelInfo) {
-        throw new Error("Unable to fetch channel data");
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+
+  const scheduleReconnect = () => {
+    if (!mergedOptions.connection?.autoReconnect || 
+        reconnectAttempts >= (mergedOptions.connection.maxReconnectAttempts || 10) ||
+        isDisconnected) {
+      logger.warn("Reconnection disabled or max attempts reached");
+      return;
+    }
+
+    const baseInterval = mergedOptions.connection.reconnectInterval || 1000;
+    const maxInterval = mergedOptions.connection.maxReconnectInterval || 30000;
+    const exponentialDelay = Math.min(baseInterval * Math.pow(2, reconnectAttempts), maxInterval);
+    
+    logger.info(`Scheduling reconnection attempt ${reconnectAttempts + 1} in ${exponentialDelay}ms`);
+    
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      try {
+        await connect();
+      } catch (error) {
+        logger.error("Reconnection attempt failed", error);
+        reconnectAttempts++;
+        scheduleReconnect();
       }
+    }, exponentialDelay);
+  };
 
-      if (mergedOptions.logger) {
-        console.log(
-          "Channel data received, establishing WebSocket connection...",
-        );
-      }
-
-      socket = createWebSocket(channelInfo.chatroom.id);
-
-      socket.on("open", () => {
-        if (mergedOptions.logger) {
-          console.log(`Connected to channel: ${channelName}`);
+  const connect = async (): Promise<void> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          logger.debug("Already connected to WebSocket");
+          resolve();
+          return;
         }
-        emitter.emit("ready", getUser());
-      });
 
-      socket.on("message", (data: WebSocket.Data) => {
-        const parsedMessage = parseMessage(data.toString());
-        if (parsedMessage) {
-          switch (parsedMessage.type) {
-            case "ChatMessage":
-              if (mergedOptions.plainEmote) {
-                const messageData = parsedMessage.data as MessageData;
-                messageData.content = messageData.content.replace(
-                  /\[emote:(\d+):(\w+)\]/g,
-                  (_, __, emoteName) => emoteName,
-                );
+        logger.info(`Connecting to channel: ${channelName}`);
+        setConnectionState(ConnectionState.CONNECTING);
+
+        // Get the real chatroom ID from Kick API
+        const channelData = await fetch(`https://kick.com/api/v1/channels/${channelName}`);
+        if (!channelData.ok) {
+          throw new Error(`Failed to get channel data for ${channelName}: ${channelData.statusText}`);
+        }
+        
+        const channelJson = await channelData.json();
+        const chatroomId = channelJson.chatroom?.id;
+        
+        if (!chatroomId) {
+          throw new Error(`No chatroom ID found for channel ${channelName}`);
+        }
+        
+        logger.info(`Found chatroom ID ${chatroomId} for channel ${channelName}`);
+        channelInfo = { id: chatroomId, name: channelName };
+
+        socket = createWebSocket({ 
+          chatroomId,
+          config: mergedOptions.websocket 
+        });
+
+        socket.on("open", () => {
+          if (isDisconnected) {
+            logger.debug("Connection opened but client is disconnected, ignoring");
+            return;
+          }
+          
+          logger.info(`Connected to channel: ${channelName}`);
+          setConnectionState(ConnectionState.CONNECTED);
+          reconnectAttempts = 0;
+          startHeartbeat();
+          emitter.emit("ready", channelInfo);
+          resolve();
+        });
+
+        socket.on("message", (data: WebSocket.Data) => {
+          if (isDisconnected) return;
+          
+          try {
+            const parsedMessage = parseMessage(data.toString(), logger);
+            if (parsedMessage) {
+              switch (parsedMessage.type) {
+                case "ChatMessage":
+                  if (mergedOptions.plainEmote) {
+                    const messageData = parsedMessage.data as MessageData;
+                    messageData.content = messageData.content.replace(
+                      /\[emote:(\d+):(\w+)\]/g,
+                      (_, __, emoteName) => emoteName,
+                    );
+                  }
+                  emitter.emit(parsedMessage.type, parsedMessage.data);
+                  break;
+                  
+                case "PusherConnectionEstablished":
+                  logger.debug("Pusher WebSocket connection established");
+                  break;
+                  
+                case "PusherSubscriptionSucceeded":
+                  logger.debug("Successfully subscribed to chat channel");
+                  break;
+                  
+                case "PusherPong":
+                  logger.debug("Received Pusher pong");
+                  break;
+                  
+                case "PusherPing":
+                  logger.debug("Received Pusher ping");
+                  break;
+                  
+                case "PusherError":
+                  logger.error("Pusher error:", parsedMessage.data);
+                  break;
+                  
+                default:
+                  // Emit all non-Pusher events for the application to handle
+                  emitter.emit(parsedMessage.type, parsedMessage.data);
+                  break;
               }
-              break;
-            case "Subscription":
-              break;
-            case "GiftedSubscriptions":
-              break;
-            case "StreamHostEvent":
-              break;
-            case "UserBannedEvent":
-              break;
-            case "UserUnbannedEvent":
-              break;
-            case "PinnedMessageCreatedEvent":
-              break;
+            }
+          } catch (error) {
+            const kickError = createError(
+              ErrorType.WEBSOCKET,
+              "Failed to parse WebSocket message",
+              error instanceof Error ? error : new Error(String(error))
+            );
+            handleError(kickError);
           }
-          emitter.emit(parsedMessage.type, parsedMessage.data);
-        }
-      });
+        });
 
-      socket.on("close", () => {
-        if (mergedOptions.logger) {
-          console.log(`Disconnected from channel: ${channelName}`);
-        }
-        emitter.emit("disconnect");
-      });
+        socket.on("close", () => {
+          stopHeartbeat();
+          if (!isDisconnected) {
+            logger.warn(`Connection closed for channel: ${channelName}`);
+            setConnectionState(ConnectionState.DISCONNECTED);
+            emitter.emit("disconnect");
+            scheduleReconnect();
+          }
+        });
 
-      socket.on("error", (error) => {
-        console.error("WebSocket error:", error);
-        emitter.emit("error", error);
-      });
-    } catch (error) {
-      console.error("Error during initialization:", error);
-      throw error;
-    }
+        socket.on("error", (error) => {
+          stopHeartbeat();
+          setConnectionState(ConnectionState.ERROR);
+          const kickError = createError(
+            ErrorType.WEBSOCKET,
+            "WebSocket connection error",
+            error instanceof Error ? error : new Error(String(error))
+          );
+          handleError(kickError);
+          emitter.emit("error", kickError);
+          reject(kickError);
+        });
+
+        socket.on("pong", () => {
+          logger.debug("Received heartbeat pong");
+        });
+
+      } catch (error) {
+        setConnectionState(ConnectionState.ERROR);
+        const kickError = createError(
+          ErrorType.CONNECTION,
+          "Failed to create WebSocket connection",
+          error instanceof Error ? error : new Error(String(error))
+        );
+        handleError(kickError);
+        reject(kickError);
+      }
+    });
   };
 
-  if (mergedOptions.readOnly === true) {
-    void initialize();
+  const disconnect = () => {
+    logger.info("Disconnecting client...");
+    isDisconnected = true;
+    setConnectionState(ConnectionState.DISCONNECTED);
+    
+    // Stop reconnection attempts
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    
+    // Stop heartbeat
+    stopHeartbeat();
+    
+    // Close WebSocket
+    if (socket) {
+      socket.removeAllListeners();
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+      socket = null;
+    }
+    
+    // Clear all event emitter listeners
+    removeAllListeners();
+    
+    // Reset client state
+    channelInfo = null;
+    reconnectAttempts = 0;
+    
+    logger.info("Client disconnected and cleaned up");
+  };
+
+  const isConnected = (): boolean => {
+    return socket !== null && socket.readyState === WebSocket.OPEN;
+  };
+
+  const getConnectionState = (): ConnectionState => {
+    return connectionState;
+  };
+
+  const getChannel = (): { id: number; name: string } | null => {
+    return channelInfo;
+  };
+
+  // Public API
+  const client: KickClient = {
+    on: (event: string, listener: (...args: any[]) => void) => {
+      addListener(event, listener, false);
+    },
+    
+    off: (event: string, listener: (...args: any[]) => void) => {
+      removeListener(event, listener);
+    },
+    
+    removeListener: (event: string, listener: (...args: any[]) => void) => {
+      removeListener(event, listener);
+    },
+    
+    once: (event: string, listener: (...args: any[]) => void) => {
+      addListener(event, listener, true);
+    },
+    
+    removeAllListeners,
+    connect,
+    
+    // Backward compatibility method
+    start: async () => {
+      logger.warn("start() is deprecated, use connect() instead");
+      return connect();
+    },
+    
+    disconnect,
+    isConnected,
+    getConnectionState,
+    getChannel,
+  };
+
+  // Backward compatibility: auto-connect if readOnly is true
+  if (options.readOnly === true) {
+    logger.info("Auto-connecting due to readOnly: true (deprecated)");
+    void connect().catch((error) => {
+      logger.error("Auto-connect failed:", error);
+    });
   }
 
-  const on = (event: string, listener: (...args: any[]) => void) => {
-    emitter.on(event, listener);
-  };
-
-  const getUser = () =>
-    channelInfo
-      ? {
-          id: channelInfo.id,
-          username: channelInfo.slug,
-          tag: channelInfo.user.username,
-        }
-      : null;
-
-  const vod = async (video_id: string) => {
-    videoInfo = await getVideoData(video_id);
-
-    if (!videoInfo) {
-      throw new Error("Unable to fetch video data");
-    }
-
-    return {
-      id: videoInfo.id,
-      title: videoInfo.livestream.session_title,
-      thumbnail: videoInfo.livestream.thumbnail,
-      duration: videoInfo.livestream.duration,
-      live_stream_id: videoInfo.live_stream_id,
-      start_time: videoInfo.livestream.start_time,
-      created_at: videoInfo.created_at,
-      updated_at: videoInfo.updated_at,
-      uuid: videoInfo.uuid,
-      views: videoInfo.views,
-      stream: videoInfo.source,
-      language: videoInfo.livestream.language,
-      livestream: videoInfo.livestream,
-      channel: videoInfo.livestream.channel,
-    };
-  };
-
-  const sendMessage = async (messageContent: string) => {
-    if (!channelInfo) {
-      throw new Error("Channel info not available");
-    }
-
-    if (messageContent.length > 500) {
-      throw new Error("Message content must be less than 500 characters");
-    }
-
-    if (!clientCookies) {
-      throw new Error("Cookies missing");
-    }
-    if (!clientBearerToken) {
-      throw new Error("Bearer token missing");
-    }
-    if (!clientToken) {
-      throw new Error("XSRF token missing");
-    }
-    // this is a temp thing till i figure out whats the axios issue
-
-    const res = fetch(
-      `https://kick.com/api/v2/messages/send/${channelInfo.chatroom.id}`,
-      {
-        headers: {
-          accept: "application/json",
-          "accept-language": "en-US,en;q=0.9",
-          authorization: `Bearer ${clientBearerToken}`,
-          "x-CSRF-token": clientToken,
-          "cache-control": "max-age=0",
-          cluster: "v2",
-          "content-type": "application/json",
-          priority: "u=1, i",
-          "sec-ch-ua": '"Not A(Brand";v="8", "Chromium";v="132"',
-          "sec-ch-ua-arch": '"arm"',
-          "sec-ch-ua-bitness": '"64"',
-          "sec-ch-ua-full-version": '"132.0.6834.111"',
-          "sec-ch-ua-full-version-list":
-            '"Not A(Brand";v="8.0.0.0", "Chromium";v="132.0.6834.111"',
-          "sec-ch-ua-mobile": "?0",
-          "sec-ch-ua-model": '""',
-          "sec-ch-ua-platform": '"macOS"',
-          "sec-ch-ua-platform-version": '"15.0.1"',
-          "sec-fetch-dest": "empty",
-          "sec-fetch-mode": "cors",
-          "sec-fetch-site": "same-origin",
-          cookie: clientCookies,
-          Referer: `https://kick.com/${channelInfo.slug}`,
-          "Referrer-Policy": "strict-origin-when-cross-origin",
-        },
-        body: `{"content":"${messageContent}","type":"message"}`,
-        method: "POST",
-      },
-    );
-  };
-
-  const banUser = async (
-    targetUser: string,
-    durationInMinutes?: number,
-    permanent: boolean = false,
-  ) => {
-    if (!channelInfo) {
-      throw new Error("Channel info not available");
-    }
-
-    checkAuth();
-
-    if (!targetUser) {
-      throw new Error("Specify a user to ban");
-    }
-
-    if (!permanent) {
-      if (!durationInMinutes) {
-        throw new Error("Specify a duration in minutes");
-      }
-
-      if (durationInMinutes < 1) {
-        throw new Error("Duration must be more than 0 minutes");
-      }
-    }
-
-    const headers = createHeaders({
-      bearerToken: clientBearerToken!,
-      xsrfToken: clientToken!,
-      cookies: clientCookies!,
-      channelSlug: channelInfo.slug,
-    });
-
-    try {
-      const data = permanent
-        ? { banned_username: targetUser, permanent: true }
-        : {
-            banned_username: targetUser,
-            duration: durationInMinutes,
-            permanent: false,
-          };
-
-      const result = await makeRequest<{ success: boolean }>(
-        "post",
-        `https://kick.com/api/v2/channels/${channelInfo.id}/bans`,
-        headers,
-        data,
-      );
-
-      if (result) {
-        console.log(
-          `User ${targetUser} ${permanent ? "banned" : "timed out"} successfully`,
-        );
-      } else {
-        console.error(`Failed to ${permanent ? "ban" : "time out"} user.`);
-      }
-    } catch (error) {
-      console.error(
-        `Error ${permanent ? "banning" : "timing out"} user:`,
-        error,
-      );
-    }
-  };
-
-  const unbanUser = async (targetUser: string) => {
-    if (!channelInfo) {
-      throw new Error("Channel info not available");
-    }
-
-    checkAuth();
-
-    if (!targetUser) {
-      throw new Error("Specify a user to unban");
-    }
-
-    const headers = createHeaders({
-      bearerToken: clientBearerToken!,
-      xsrfToken: clientToken!,
-      cookies: clientCookies!,
-      channelSlug: channelInfo.slug,
-    });
-
-    try {
-      const result = await makeRequest<{ success: boolean }>(
-        "delete",
-        `https://kick.com/api/v2/channels/${channelInfo.id}/bans/${targetUser}`,
-        headers,
-      );
-
-      if (result) {
-        console.log(`User ${targetUser} unbanned successfully`);
-      } else {
-        console.error(`Failed to unban user.`);
-      }
-    } catch (error) {
-      console.error("Error unbanning user:", error);
-    }
-  };
-
-  const deleteMessage = async (messageId: string) => {
-    if (!channelInfo) {
-      throw new Error("Channel info not available");
-    }
-
-    checkAuth();
-
-    if (!messageId) {
-      throw new Error("Specify a messageId to delete");
-    }
-
-    const headers = createHeaders({
-      bearerToken: clientBearerToken!,
-      xsrfToken: clientToken!,
-      cookies: clientCookies!,
-      channelSlug: channelInfo.slug,
-    });
-
-    try {
-      const result = await makeRequest<{ success: boolean }>(
-        "delete",
-        `https://kick.com/api/v2/channels/${channelInfo.id}/messages/${messageId}`,
-        headers,
-      );
-
-      if (result) {
-        console.log(`Message ${messageId} deleted successfully`);
-      } else {
-        console.error(`Failed to delete message.`);
-      }
-    } catch (error) {
-      console.error("Error deleting message:", error);
-    }
-  };
-
-  const slowMode = async (mode: "on" | "off", durationInSeconds?: number) => {
-    if (!channelInfo) {
-      throw new Error("Channel info not available");
-    }
-
-    checkAuth();
-
-    if (mode !== "on" && mode !== "off") {
-      throw new Error("Invalid mode, must be either 'on' or 'off'");
-    }
-
-    if (mode === "on" && (!durationInSeconds || durationInSeconds < 1)) {
-      throw new Error(
-        "Invalid duration, must be greater than 0 if mode is 'on'",
-      );
-    }
-
-    const headers = createHeaders({
-      bearerToken: clientBearerToken!,
-      xsrfToken: clientToken!,
-      cookies: clientCookies!,
-      channelSlug: channelInfo.slug,
-    });
-
-    try {
-      const data =
-        mode === "off"
-          ? { slow_mode: false }
-          : { slow_mode: true, message_interval: durationInSeconds };
-
-      const result = await makeRequest<{ success: boolean }>(
-        "put",
-        `https://kick.com/api/v2/channels/${channelInfo.slug}/chatroom`,
-        headers,
-        data,
-      );
-
-      if (result?.success) {
-        console.log(
-          mode === "off"
-            ? "Slow mode disabled successfully"
-            : `Slow mode enabled with ${durationInSeconds} second interval`,
-        );
-      } else {
-        console.error(
-          `Failed to ${mode === "off" ? "disable" : "enable"} slow mode.`,
-        );
-      }
-    } catch (error) {
-      console.error(
-        `Error ${mode === "off" ? "disabling" : "enabling"} slow mode:`,
-        error,
-      );
-    }
-  };
-
-  const getPoll = async (targetChannel?: string) => {
-    const channel = targetChannel || channelName;
-
-    if (!targetChannel && !channelInfo) {
-      throw new Error("Channel info not available");
-    }
-
-    const headers = createHeaders({
-      bearerToken: clientBearerToken!,
-      xsrfToken: clientToken!,
-      cookies: clientCookies!,
-      channelSlug: channel,
-    });
-
-    try {
-      const result = await makeRequest<Poll>(
-        "get",
-        `https://kick.com/api/v2/channels/${channel}/polls`,
-        headers,
-      );
-
-      if (result) {
-        console.log(`Poll retrieved successfully for channel: ${channel}`);
-        return result;
-      }
-    } catch (error) {
-      console.error(`Error retrieving poll for channel ${channel}:`, error);
-    }
-
-    return null;
-  };
-
-  const getLeaderboards = async (targetChannel?: string) => {
-    const channel = targetChannel || channelName;
-
-    if (!targetChannel && !channelInfo) {
-      throw new Error("Channel info not available");
-    }
-
-    const headers = createHeaders({
-      bearerToken: clientBearerToken!,
-      xsrfToken: clientToken!,
-      cookies: clientCookies!,
-      channelSlug: channel,
-    });
-
-    try {
-      const result = await makeRequest<Leaderboard>(
-        "get",
-        `https://kick.com/api/v2/channels/${channel}/leaderboards`,
-        headers,
-      );
-
-      if (result) {
-        console.log(
-          `Leaderboards retrieved successfully for channel: ${channel}`,
-        );
-        return result;
-      }
-    } catch (error) {
-      console.error(
-        `Error retrieving leaderboards for channel ${channel}:`,
-        error,
-      );
-    }
-
-    return null;
-  };
-
-  return {
-    login,
-    on,
-    get user() {
-      return getUser();
-    },
-    vod,
-    sendMessage,
-    banUser,
-    unbanUser,
-    deleteMessage,
-    slowMode,
-    getPoll,
-    getLeaderboards,
-  };
+  return client;
 };

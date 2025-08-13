@@ -10,8 +10,17 @@ import type {
   MessageDeletedEvent,
 } from "../types/events";
 import { parseJSON } from "../utils/utils";
+import type { Logger } from "../types/client";
 
-export const parseMessage = (message: string) => {
+// Default no-op logger for when no logger is provided
+const defaultLogger: Logger = {
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
+
+export const parseMessage = (message: string, logger: Logger = defaultLogger) => {
   try {
     const messageEventJSON = parseJSON<MessageEvent>(message);
 
@@ -64,15 +73,37 @@ export const parseMessage = (message: string) => {
         return { type: "PollDelete", data };
       }
 
+      // Pusher protocol events (not chat events)
+      case "pusher:connection_established": {
+        logger.debug("Pusher connection established");
+        return { type: "PusherConnectionEstablished", data: parseJSON(messageEventJSON.data) };
+      }
+      case "pusher_internal:subscription_succeeded": {
+        logger.debug("Pusher subscription succeeded");
+        return { type: "PusherSubscriptionSucceeded", data: parseJSON(messageEventJSON.data) };
+      }
+      case "pusher:pong": {
+        logger.debug("Pusher pong received");
+        return { type: "PusherPong", data: parseJSON(messageEventJSON.data) };
+      }
+      case "pusher:ping": {
+        logger.debug("Pusher ping received");
+        return { type: "PusherPing", data: parseJSON(messageEventJSON.data) };
+      }
+      case "pusher:error": {
+        logger.warn("Pusher error:", messageEventJSON.data);
+        return { type: "PusherError", data: parseJSON(messageEventJSON.data) };
+      }
+
       default: {
-        console.log("Unknown event type:", messageEventJSON.event);
+        logger.debug("Unknown event type:", messageEventJSON.event);
         return null;
       }
     }
 
     return null;
   } catch (error) {
-    console.error("Error parsing message:", error);
+    logger.error("Error parsing message:", error);
     return null;
   }
 };

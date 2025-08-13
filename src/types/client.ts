@@ -1,106 +1,105 @@
-import type { Channel, Livestream } from "./video";
+import type WebSocket from "ws";
 
 export type EventHandler<T> = (data: T) => void;
 
-export interface ClientOptions {
-  plainEmote?: boolean;
-  logger?: boolean;
-  readOnly?: boolean;
+export interface Logger {
+  debug: (message: string, ...args: any[]) => void;
+  info: (message: string, ...args: any[]) => void;
+  warn: (message: string, ...args: any[]) => void;
+  error: (message: string, error?: any) => void;
 }
 
-export interface Video {
-  id: number;
-  title: string;
-  thumbnail: string;
-  duration: number;
-  live_stream_id: number;
-  start_time: Date;
-  created_at: Date;
-  updated_at: Date;
-  uuid: string;
-  views: number;
-  stream: string;
-  language: string;
-  livestream: Livestream;
-  channel: Channel;
+export interface ConnectionOptions {
+  /** Enable automatic reconnection on disconnect */
+  autoReconnect?: boolean;
+  /** Maximum number of reconnection attempts (default: 10) */
+  maxReconnectAttempts?: number;
+  /** Base reconnection interval in ms (default: 1000) */
+  reconnectInterval?: number;
+  /** Maximum reconnection interval in ms (default: 30000) */
+  maxReconnectInterval?: number;
+  /** Heartbeat interval in ms (default: 30000) */
+  heartbeatInterval?: number;
+}
+
+export enum ConnectionState {
+  DISCONNECTED = 'disconnected',
+  CONNECTING = 'connecting',
+  CONNECTED = 'connected',
+  RECONNECTING = 'reconnecting',
+  ERROR = 'error'
+}
+
+export interface WebSocketConfig {
+  /** Custom Pusher WebSocket URL (defaults to wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679) */
+  pusherUrl?: string;
+  /** Pusher app key (extracted from URL if not provided) */
+  pusherAppKey?: string;
+  /** Protocol version (defaults to "7") */
+  protocol?: string;
+  /** Client identifier (defaults to "js") */
+  client?: string;
+  /** Client version (defaults to "7.4.0") */
+  version?: string;
+  /** Flash support (defaults to "false") */
+  flash?: string;
+  /** Custom WebSocket options passed to ws constructor */
+  wsOptions?: WebSocket.ClientOptions;
+  /** Custom headers for WebSocket handshake */
+  headers?: Record<string, string>;
+}
+
+export interface ClientOptions {
+  plainEmote?: boolean;
+  /** Logger instance for debugging and monitoring, or boolean for console logger */
+  logger?: Logger | boolean;
+  /** @deprecated No longer used - kept for backward compatibility */
+  readOnly?: boolean;
+  /** WebSocket configuration options */
+  websocket?: WebSocketConfig;
+  /** Connection and reconnection options */
+  connection?: ConnectionOptions;
+  /** Error handler for connection and WebSocket errors */
+  onError?: (error: KickError) => void;
+  /** Connection state change handler */
+  onConnectionStateChange?: (state: ConnectionState) => void;
 }
 
 export interface KickClient {
+  /** Add event listener */
   on: (event: string, listener: (...args: any[]) => void) => void;
-  vod: (video_id: string) => Promise<Video>;
-  login: (credentials: LoginOptions) => Promise<boolean>;
-  user: {
-    id: number;
-    username: string;
-    tag: string;
-  } | null;
-  sendMessage: (messageContent: string) => Promise<void>;
-  banUser: (
-    targetUser: string,
-    durationInMinutes?: number,
-    permanent?: boolean,
-  ) => Promise<void>;
-  unbanUser: (targetUser: string) => Promise<void>;
-  deleteMessage: (messageId: string) => Promise<void>;
-  slowMode: (mode: "on" | "off", durationInSeconds?: number) => Promise<void>;
-  getPoll: (targetChannel?: string) => Promise<Poll | null>;
-  getLeaderboards: (targetChannel?: string) => Promise<Leaderboard | null>;
+  /** Remove specific event listener */
+  off: (event: string, listener: (...args: any[]) => void) => void;
+  /** Remove specific event listener (alias for off) */
+  removeListener: (event: string, listener: (...args: any[]) => void) => void;
+  /** Add one-time event listener */
+  once: (event: string, listener: (...args: any[]) => void) => void;
+  /** Remove all listeners for an event (or all events if no event specified) */
+  removeAllListeners: (event?: string) => void;
+  /** Connect to the chat WebSocket */
+  connect: () => Promise<void>;
+  /** @deprecated Use connect() instead */
+  start?: () => Promise<void>;
+  /** Disconnect and cleanup the client */
+  disconnect: () => void;
+  /** Check if currently connected to chat */
+  isConnected: () => boolean;
+  /** Get current connection state */
+  getConnectionState: () => ConnectionState;
+  /** Get channel info from WebSocket connection */
+  getChannel: () => { id: number; name: string; } | null;
 }
 
-export interface AuthenticationSettings {
-  username: string;
-  password: string;
-  otp_secret: string;
+export enum ErrorType {
+  CONNECTION = 'connection',
+  WEBSOCKET = 'websocket',
+  VALIDATION = 'validation'
 }
 
-type LoginCredentials = {
-  username: string;
-  password: string;
-  otp_secret: string;
-};
-
-type TokenCredentials = {
-  bearerToken: string;
-  xsrfToken: string;
-  cookies: string;
-};
-export type LoginOptions =
-  | { type: "login"; credentials: LoginCredentials }
-  | { type: "tokens"; credentials: TokenCredentials };
-
-export type Poll = {
-  status: {
-    code: number;
-    message: string;
-    error: boolean;
-  };
-  data: {
-    title: string;
-    duration: number;
-    result_display_duration: number;
-    created_at: Date;
-    options: {
-      id: number;
-      label: string;
-      votes: number;
-    }[];
-    remaining: number;
-    has_voted: boolean;
-    voted_option_id: null;
-  };
-};
-
-export type Leaderboard = {
-  gifts: Gift[];
-  gifts_enabled: boolean;
-  gifts_week: Gift[];
-  gifts_week_enabled: boolean;
-  gifts_month: Gift[];
-  gifts_month_enabled: boolean;
-};
-
-export type Gift = {
-  user_id: number;
-  username: string;
-  quantity: number;
-};
+export interface KickError {
+  type: ErrorType;
+  message: string;
+  originalError?: Error;
+  code?: string | number;
+  context?: Record<string, unknown>;
+}
